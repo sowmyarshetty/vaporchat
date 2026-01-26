@@ -98,7 +98,11 @@ export function RoomClient({ roomId }: RoomClientProps) {
 
         // Subscribe to new messages
         const channel = supabase
-          .channel(`room:${roomId}`)
+          .channel(`room:${roomId}`, {
+            config: {
+              broadcast: { self: true },
+            },
+          })
           .on(
             "postgres_changes",
             {
@@ -108,7 +112,15 @@ export function RoomClient({ roomId }: RoomClientProps) {
               filter: `room_id=eq.${roomId}`,
             },
             (payload) => {
-              setMessages((prev) => [...prev, payload.new as Message]);
+              console.log("New message received:", payload);
+              const newMessage = payload.new as Message;
+              setMessages((prev) => {
+                // Avoid duplicates
+                if (prev.some((m) => m.id === newMessage.id)) {
+                  return prev;
+                }
+                return [...prev, newMessage];
+              });
             }
           )
           .on(
@@ -119,15 +131,23 @@ export function RoomClient({ roomId }: RoomClientProps) {
               table: "messages",
               filter: `room_id=eq.${roomId}`,
             },
-            () => {
+            (payload) => {
+              console.log("Messages deleted:", payload);
               // When any message is deleted, clear all (vaporize)
               setMessages([]);
             }
           )
-          .subscribe((status) => {
+          .subscribe((status, err) => {
+            console.log("Realtime subscription status:", status, err);
             if (status === "SUBSCRIBED") {
               setConnected(true);
             } else if (status === "CLOSED" || status === "CHANNEL_ERROR") {
+              setConnected(false);
+              if (err) {
+                console.error("Realtime subscription error:", err);
+              }
+            } else if (status === "TIMED_OUT") {
+              console.error("Realtime subscription timed out");
               setConnected(false);
             }
           });
