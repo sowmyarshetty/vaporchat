@@ -131,9 +131,36 @@ export function RoomClient({ roomId }: RoomClientProps) {
               table: "messages",
               filter: `room_id=eq.${roomId}`,
             },
-            (payload) => {
+            async (payload) => {
               console.log("Messages deleted:", payload);
-              // When any message is deleted, clear all (vaporize)
+              // When any message is deleted, check if all are gone
+              // Supabase might not fire events for bulk deletes, so we check the table
+              const { data: remainingMessages } = await supabase
+                .from("messages")
+                .select("id")
+                .eq("room_id", roomId)
+                .limit(1);
+              
+              // If no messages remain, clear the UI
+              if (!remainingMessages || remainingMessages.length === 0) {
+                setMessages([]);
+              } else {
+                // If some messages remain, reload all to sync
+                const { data: allMessages } = await supabase
+                  .from("messages")
+                  .select("*")
+                  .eq("room_id", roomId)
+                  .order("sent_at", { ascending: true });
+                if (allMessages) setMessages(allMessages);
+              }
+            }
+          )
+          .on(
+            "broadcast",
+            { event: "vaporize" },
+            (payload) => {
+              console.log("Vaporize broadcast received:", payload);
+              // Clear all messages when vaporize event is broadcast
               setMessages([]);
             }
           )
@@ -203,9 +230,12 @@ export function RoomClient({ roomId }: RoomClientProps) {
   );
 
   const handleVaporize = useCallback(async () => {
-    if (!sessionId) return;
+    if (!sessionId || !channelRef.current) return;
 
     try {
+      // Optimistically clear messages immediately (better UX)
+      setMessages([]);
+
       const res = await fetch(
         `/api/rooms/${roomId}/messages?sessionId=${sessionId}`,
         { method: "DELETE" }
@@ -214,10 +244,41 @@ export function RoomClient({ roomId }: RoomClientProps) {
       if (!res.ok) {
         const data = await res.json();
         setJoinError(data.error || "Failed to clear messages");
+        // Reload messages if deletion failed
+        const { data: messagesData } = await supabase
+          .from("messages")
+          .select("*")
+          .eq("room_id", roomId)
+          .order("sent_at", { ascending: true });
+        if (messagesData) setMessages(messagesData);
+      } else {
+        // Broadcast vaporize event to other clients in the room
+        // This ensures real-time updates for other users
+        try {
+          await channelRef.current.send({
+            type: "broadcast",
+            event: "vaporize",
+            payload: { roomId, timestamp: Date.now() },
+          });
+        } catch (broadcastError) {
+          // Non-critical - deletion succeeded, broadcast is just for real-time UX
+          console.warn("Broadcast error (non-critical):", broadcastError);
+        }
       }
     } catch (error) {
       console.error("Error clearing messages:", error);
       setJoinError("Failed to clear messages");
+      // Reload messages if deletion failed
+      try {
+        const { data: messagesData } = await supabase
+          .from("messages")
+          .select("*")
+          .eq("room_id", roomId)
+          .order("sent_at", { ascending: true });
+        if (messagesData) setMessages(messagesData);
+      } catch (reloadError) {
+        console.error("Error reloading messages:", reloadError);
+      }
     }
   }, [sessionId, roomId]);
 
