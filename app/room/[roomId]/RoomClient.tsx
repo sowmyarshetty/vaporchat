@@ -10,14 +10,14 @@ import {
 } from "react";
 import { Footer } from "@/app/components/Footer";
 import { Header } from "@/app/components/Header";
-import { disconnectSocket, getSocket } from "@/app/lib/socket";
+import { supabase } from "@/lib/supabase/client";
 
 type Message = {
   id: string;
-  senderId: string;
-  senderName: string;
+  sender_id: string;
+  sender_name: string;
   content: string;
-  sentAt: number;
+  sent_at: string;
 };
 
 type RoomClientProps = { roomId: string };
@@ -34,63 +34,118 @@ export function RoomClient({ roomId }: RoomClientProps) {
   const [linkCopied, setLinkCopied] = useState(false);
   const [connected, setConnected] = useState(false);
   const [joinError, setJoinError] = useState("");
+  const [loading, setLoading] = useState(true);
   const listRef = useRef<HTMLDivElement>(null);
-  const socketRef = useRef<ReturnType<typeof getSocket> | null>(null);
+  const channelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
 
+  // Load initial room data and messages
   useEffect(() => {
     if (typeof window === "undefined") return;
     if (!sessionId) {
       router.replace(`/join?room=${roomId}`);
       return;
     }
-    const socket = getSocket();
-    socketRef.current = socket;
 
-    const onConnect = () => setConnected(true);
-    const onDisconnect = () => setConnected(false);
+    async function loadRoom() {
+      try {
+        setLoading(true);
+        setJoinError("");
 
-    socket.on("connect", onConnect);
-    socket.on("disconnect", onDisconnect);
-    if (socket.connected) setConnected(true);
+        // Verify session exists
+        const { data: session, error: sessionError } = await supabase
+          .from("sessions")
+          .select("display_name, room_id")
+          .eq("id", sessionId)
+          .eq("room_id", roomId)
+          .single();
 
-    socket.emit("join-room", { roomId, sessionId });
+        if (sessionError || !session) {
+          setJoinError("Invalid session. Please join again.");
+          setLoading(false);
+          return;
+        }
 
-    socket.on("join-ok", (payload: { roomName?: string; messages?: Message[] }) => {
-      setJoinError("");
-      if (payload.roomName) setRoomName(payload.roomName);
-      if (Array.isArray(payload.messages)) setMessages(payload.messages);
-    });
+        // Load room name
+        const { data: room, error: roomError } = await supabase
+          .from("rooms")
+          .select("name")
+          .eq("id", roomId)
+          .single();
 
-    socket.on("join-error", (payload: { error?: string }) => {
-      setJoinError(payload?.error ?? "Could not join room");
-    });
+        if (roomError || !room) {
+          setJoinError("Room not found.");
+          setLoading(false);
+          return;
+        }
 
-    socket.on("message", (msg: Message) => {
-      setMessages((prev) => [...prev, msg]);
-    });
+        setRoomName(room.name);
 
-    socket.on("messages-cleared", () => {
-      setMessages([]);
-    });
+        // Load messages
+        const { data: messagesData, error: messagesError } = await supabase
+          .from("messages")
+          .select("*")
+          .eq("room_id", roomId)
+          .order("sent_at", { ascending: true });
 
-    socket.on("exit-ok", () => {
-      disconnectSocket();
-      socketRef.current = null;
-      router.replace("/create");
-    });
+        if (messagesError) {
+          console.error("Error loading messages:", messagesError);
+        } else {
+          setMessages(messagesData || []);
+        }
+
+        setConnected(true);
+        setLoading(false);
+
+        // Subscribe to new messages
+        const channel = supabase
+          .channel(`room:${roomId}`)
+          .on(
+            "postgres_changes",
+            {
+              event: "INSERT",
+              schema: "public",
+              table: "messages",
+              filter: `room_id=eq.${roomId}`,
+            },
+            (payload) => {
+              setMessages((prev) => [...prev, payload.new as Message]);
+            }
+          )
+          .on(
+            "postgres_changes",
+            {
+              event: "DELETE",
+              schema: "public",
+              table: "messages",
+              filter: `room_id=eq.${roomId}`,
+            },
+            () => {
+              // When any message is deleted, clear all (vaporize)
+              setMessages([]);
+            }
+          )
+          .subscribe((status) => {
+            if (status === "SUBSCRIBED") {
+              setConnected(true);
+            } else if (status === "CLOSED" || status === "CHANNEL_ERROR") {
+              setConnected(false);
+            }
+          });
+
+        channelRef.current = channel;
+      } catch (error) {
+        console.error("Error loading room:", error);
+        setJoinError("Failed to load room.");
+        setLoading(false);
+      }
+    }
+
+    loadRoom();
 
     return () => {
-      socket.off("connect", onConnect);
-      socket.off("disconnect", onDisconnect);
-      socket.off("join-ok");
-      socket.off("join-error");
-      socket.off("message");
-      socket.off("messages-cleared");
-      socket.off("exit-ok");
-      if (socketRef.current && sessionId) {
-        socket.emit("exit-room");
-        disconnectSocket();
-        socketRef.current = null;
+      if (channelRef.current) {
+        supabase.removeChannel(channelRef.current);
+        channelRef.current = null;
       }
     };
   }, [roomId, sessionId, router]);
@@ -100,23 +155,74 @@ export function RoomClient({ roomId }: RoomClientProps) {
   }, [messages]);
 
   const handleSend = useCallback(
-    (e: FormEvent) => {
+    async (e: FormEvent) => {
       e.preventDefault();
       const text = input.trim();
-      if (!text || !socketRef.current) return;
-      socketRef.current.emit("send-message", { content: text });
-      setInput("");
+      if (!text || !sessionId) return;
+
+      try {
+        const res = await fetch(`/api/rooms/${roomId}/messages`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ sessionId, content: text }),
+        });
+
+        if (!res.ok) {
+          const data = await res.json();
+          setJoinError(data.error || "Failed to send message");
+          return;
+        }
+
+        setInput("");
+      } catch (error) {
+        console.error("Error sending message:", error);
+        setJoinError("Failed to send message");
+      }
     },
-    [input]
+    [input, sessionId, roomId]
   );
 
-  const handleVaporize = useCallback(() => {
-    socketRef.current?.emit("vaporize-history");
-  }, []);
+  const handleVaporize = useCallback(async () => {
+    if (!sessionId) return;
 
-  const handleExit = useCallback(() => {
-    socketRef.current?.emit("exit-room");
-  }, []);
+    try {
+      const res = await fetch(
+        `/api/rooms/${roomId}/messages?sessionId=${sessionId}`,
+        { method: "DELETE" }
+      );
+
+      if (!res.ok) {
+        const data = await res.json();
+        setJoinError(data.error || "Failed to clear messages");
+      }
+    } catch (error) {
+      console.error("Error clearing messages:", error);
+      setJoinError("Failed to clear messages");
+    }
+  }, [sessionId, roomId]);
+
+  const handleExit = useCallback(async () => {
+    if (!sessionId) return;
+
+    try {
+      const res = await fetch(`/api/rooms/${roomId}/exit`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId }),
+      });
+
+      if (res.ok) {
+        router.replace("/create");
+      } else {
+        const data = await res.json();
+        setJoinError(data.error || "Failed to exit room");
+      }
+    } catch (error) {
+      console.error("Error exiting room:", error);
+      // Still navigate away even if API call fails
+      router.replace("/create");
+    }
+  }, [sessionId, roomId, router]);
 
   const handleCopyLink = useCallback(async () => {
     const url = `${typeof window !== "undefined" ? window.location.origin : ""}/join?room=${roomId}`;
@@ -148,7 +254,7 @@ export function RoomClient({ roomId }: RoomClientProps) {
               <span
                 className={`text-xs ${connected ? "text-emerald-600" : "text-[var(--vapor-warm-gray)]"}`}
               >
-                {connected ? "Connected" : "Connecting…"}
+                {connected ? "Connected" : loading ? "Loading…" : "Disconnected"}
               </span>
               <button
                 type="button"
@@ -176,45 +282,53 @@ export function RoomClient({ roomId }: RoomClientProps) {
             </p>
           )}
 
-          <div
-            ref={listRef}
-            className="mb-6 flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto rounded-lg border border-[var(--vapor-stone)] bg-white px-4 py-4"
-          >
-            {messages.length === 0 && !joinError ? (
-              <p className="py-8 text-center text-sm text-[var(--vapor-warm-gray)]">
-                No messages yet. Say something or share the room link for others
-                to join.
+          {loading ? (
+            <div className="mb-6 flex min-h-0 flex-1 items-center justify-center">
+              <p className="text-sm text-[var(--vapor-warm-gray)]">
+                Loading room…
               </p>
-            ) : (
-              messages.map((m) => (
-                <div
-                  key={m.id}
-                  className={`flex flex-col ${isYou(m.senderId) ? "items-end" : "items-start"}`}
-                >
-                  <span
-                    className={`text-xs font-medium ${
-                      isYou(m.senderId)
-                        ? "text-[var(--vapor-amber)]"
-                        : "text-[var(--vapor-warm-gray)]"
-                    }`}
-                  >
-                    {isYou(m.senderId)
-                      ? `${m.senderName} (You)`
-                      : m.senderName}
-                  </span>
+            </div>
+          ) : (
+            <div
+              ref={listRef}
+              className="mb-6 flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto rounded-lg border border-[var(--vapor-stone)] bg-white px-4 py-4"
+            >
+              {messages.length === 0 ? (
+                <p className="py-8 text-center text-sm text-[var(--vapor-warm-gray)]">
+                  No messages yet. Say something or share the room link for others
+                  to join.
+                </p>
+              ) : (
+                messages.map((m) => (
                   <div
-                    className={`mt-0.5 max-w-[85%] rounded-lg px-3 py-2 ${
-                      isYou(m.senderId)
-                        ? "bg-[var(--vapor-charcoal)] text-white"
-                        : "bg-[var(--vapor-bg)] text-[var(--vapor-charcoal)]"
-                    }`}
+                    key={m.id}
+                    className={`flex flex-col ${isYou(m.sender_id) ? "items-end" : "items-start"}`}
                   >
-                    <p className="text-sm">{m.content}</p>
+                    <span
+                      className={`text-xs font-medium ${
+                        isYou(m.sender_id)
+                          ? "text-[var(--vapor-amber)]"
+                          : "text-[var(--vapor-warm-gray)]"
+                      }`}
+                    >
+                      {isYou(m.sender_id)
+                        ? `${m.sender_name} (You)`
+                        : m.sender_name}
+                    </span>
+                    <div
+                      className={`mt-0.5 max-w-[85%] rounded-lg px-3 py-2 ${
+                        isYou(m.sender_id)
+                          ? "bg-[var(--vapor-charcoal)] text-white"
+                          : "bg-[var(--vapor-bg)] text-[var(--vapor-charcoal)]"
+                      }`}
+                    >
+                      <p className="text-sm">{m.content}</p>
+                    </div>
                   </div>
-                </div>
-              ))
-            )}
-          </div>
+                ))
+              )}
+            </div>
+          )}
 
           <form onSubmit={handleSend} className="space-y-4">
             <div>
@@ -229,14 +343,14 @@ export function RoomClient({ roomId }: RoomClientProps) {
                 onChange={(e) => setInput(e.target.value)}
                 className="w-full rounded-lg border border-[var(--vapor-stone)] bg-white px-4 py-3 text-[var(--vapor-charcoal)] placeholder:text-[var(--vapor-warm-gray)] focus:border-[var(--vapor-amber)] focus:outline-none focus:ring-1 focus:ring-[var(--vapor-amber)]"
                 autoComplete="off"
-                disabled={!!joinError}
+                disabled={!!joinError || loading}
               />
             </div>
             <div className="flex flex-wrap gap-3">
               <button
                 type="button"
                 onClick={handleExit}
-                disabled={!!joinError}
+                disabled={!!joinError || loading}
                 className="rounded-lg border border-[var(--vapor-stone)] bg-white px-4 py-2 text-sm font-medium text-[var(--vapor-charcoal)] transition-colors hover:bg-[var(--vapor-bg)] focus:outline-none focus:ring-2 focus:ring-[var(--vapor-amber)] focus:ring-offset-2 disabled:opacity-60"
               >
                 Exit Room
@@ -244,14 +358,14 @@ export function RoomClient({ roomId }: RoomClientProps) {
               <button
                 type="button"
                 onClick={handleVaporize}
-                disabled={!!joinError}
+                disabled={!!joinError || loading}
                 className="rounded-lg border border-[var(--vapor-stone)] bg-white px-4 py-2 text-sm font-medium text-[var(--vapor-charcoal)] transition-colors hover:bg-[var(--vapor-bg)] focus:outline-none focus:ring-2 focus:ring-[var(--vapor-amber)] focus:ring-offset-2 disabled:opacity-60"
               >
                 Vaporize History
               </button>
               <button
                 type="submit"
-                disabled={!!joinError}
+                disabled={!!joinError || loading}
                 className="rounded-lg bg-[var(--vapor-charcoal)] px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-[#2d2d2d] focus:outline-none focus:ring-2 focus:ring-[var(--vapor-amber)] focus:ring-offset-2 disabled:opacity-60"
               >
                 Send Message

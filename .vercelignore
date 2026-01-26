@@ -1,0 +1,5 @@
+# Vercel doesn't support custom servers or WebSockets
+# This app requires a platform that supports persistent Node.js servers
+# See DEPLOYMENT.md for alternatives (Railway, Render, Fly.io, etc.)
+
+server.js
