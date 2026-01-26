@@ -10,4 +10,8 @@ if (!supabaseUrl || !supabaseServiceKey) {
 }
 
 // Server-side client with service role key (bypasses RLS)
-export const supabaseAdmin = createClient(supabaseUrl, supabaseServiceKey);
+export const supabaseAdmin = createClient(supabaseUrl, supabaseServiceKey, {
+  auth: {
+    persistSession: false,
+  },
+});
