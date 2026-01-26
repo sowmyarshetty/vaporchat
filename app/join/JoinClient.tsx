@@ -1,29 +1,54 @@
 "use client";
 
-import { useRouter } from "next/navigation";
-import { useState, type FormEvent } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
+import { useEffect, useState, type FormEvent } from "react";
 import { Footer } from "@/app/components/Footer";
 import { Header } from "@/app/components/Header";
 
-export default function CreateRoomPage() {
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function isUUID(s: string): boolean {
+  return UUID_RE.test((s || "").trim());
+}
+
+function extractRoomFromUrl(s: string): string | null {
+  const t = (s || "").trim();
+  const match = t.match(/[?&]room=([^&]+)/);
+  if (!match) return null;
+  try {
+    return decodeURIComponent(match[1].trim());
+  } catch {
+    return match[1].trim();
+  }
+}
+
+export function JoinClient() {
   const router = useRouter();
-  const [roomName, setRoomName] = useState("");
+  const searchParams = useSearchParams();
+  const roomFromUrl = searchParams.get("room") ?? "";
+
+  const [roomInput, setRoomInput] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    if (roomFromUrl) setRoomInput(roomFromUrl);
+  }, [roomFromUrl]);
 
   async function handleSubmit(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
     setError("");
     setLoading(true);
 
-    const trimmedRoom = roomName.trim();
+    const trimmedRoom = roomInput.trim();
     const trimmedDisplay = displayName.trim();
     const trimmedPassword = password.trim();
 
     if (!trimmedRoom) {
-      setError("Please specify a room name.");
+      setError("Please specify the room you want to join (ID or name).");
       setLoading(false);
       return;
     }
@@ -33,25 +58,30 @@ export default function CreateRoomPage() {
       return;
     }
     if (!trimmedPassword) {
-      setError("Please specify a password.");
+      setError("Please specify the room password.");
       setLoading(false);
       return;
     }
 
     try {
-      const res = await fetch("/api/rooms", {
+      const roomFromPaste = extractRoomFromUrl(trimmedRoom);
+      const roomIdOrName = roomFromPaste ?? trimmedRoom;
+      const body: Record<string, string> = {
+        password: trimmedPassword,
+        displayName: trimmedDisplay,
+      };
+      if (isUUID(roomIdOrName)) body.roomId = roomIdOrName;
+      else body.roomName = roomIdOrName;
+
+      const res = await fetch("/api/rooms/join", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          name: trimmedRoom,
-          password: trimmedPassword,
-          displayName: trimmedDisplay,
-        }),
+        body: JSON.stringify(body),
       });
       const data = await res.json();
 
       if (!res.ok) {
-        setError(data.error || "Failed to create room");
+        setError(data.error || "Failed to join room");
         setLoading(false);
         return;
       }
@@ -75,10 +105,11 @@ export default function CreateRoomPage() {
         <div className="w-full max-w-md space-y-8">
           <div className="text-center">
             <h1 className="text-2xl font-medium tracking-tight text-[var(--vapor-charcoal)]">
-              Create a Room
+              Join a Room
             </h1>
             <p className="mt-2 text-sm text-[var(--vapor-warm-gray)]">
-              Set up a virtual chat room and share the link with others.
+              Enter the room ID or name, password, and your display name. Use
+              the link shared with you to pre-fill the room.
             </p>
           </div>
 
@@ -93,15 +124,15 @@ export default function CreateRoomPage() {
             )}
 
             <div>
-              <label htmlFor="create-room-name" className="sr-only">
-                Specify Room Name
+              <label htmlFor="join-room" className="sr-only">
+                Room ID or Name
               </label>
               <input
-                id="create-room-name"
+                id="join-room"
                 type="text"
-                placeholder="Specify Room Name"
-                value={roomName}
-                onChange={(e) => setRoomName(e.target.value)}
+                placeholder="Room ID or Name (or paste shared link)"
+                value={roomInput}
+                onChange={(e) => setRoomInput(e.target.value)}
                 className="w-full rounded-lg border border-[var(--vapor-stone)] bg-white px-4 py-3 text-[var(--vapor-charcoal)] placeholder:text-[var(--vapor-warm-gray)] focus:border-[var(--vapor-amber)] focus:outline-none focus:ring-1 focus:ring-[var(--vapor-amber)]"
                 autoComplete="off"
                 disabled={loading}
@@ -109,27 +140,27 @@ export default function CreateRoomPage() {
             </div>
 
             <div>
-              <label htmlFor="create-password" className="sr-only">
+              <label htmlFor="join-password" className="sr-only">
                 Specify Password
               </label>
               <input
-                id="create-password"
+                id="join-password"
                 type="password"
                 placeholder="Specify Password"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 className="w-full rounded-lg border border-[var(--vapor-stone)] bg-white px-4 py-3 text-[var(--vapor-charcoal)] placeholder:text-[var(--vapor-warm-gray)] focus:border-[var(--vapor-amber)] focus:outline-none focus:ring-1 focus:ring-[var(--vapor-amber)]"
-                autoComplete="new-password"
+                autoComplete="current-password"
                 disabled={loading}
               />
             </div>
 
             <div>
-              <label htmlFor="create-display-name" className="sr-only">
+              <label htmlFor="join-display-name" className="sr-only">
                 Specify Your Display Name
               </label>
               <input
-                id="create-display-name"
+                id="join-display-name"
                 type="text"
                 placeholder="Specify Your Display Name"
                 value={displayName}
@@ -145,7 +176,7 @@ export default function CreateRoomPage() {
               disabled={loading}
               className="w-full rounded-lg bg-[var(--vapor-charcoal)] px-4 py-3 font-medium text-white transition-colors hover:bg-[#2d2d2d] focus:outline-none focus:ring-2 focus:ring-[var(--vapor-amber)] focus:ring-offset-2 disabled:opacity-60"
             >
-              {loading ? "Creating…" : "Create"}
+              {loading ? "Joining…" : "Join"}
             </button>
           </form>
         </div>
