@@ -158,9 +158,22 @@ export function RoomClient({ roomId }: RoomClientProps) {
             "broadcast",
             { event: "typing" },
             (payload) => {
+              console.log("Typing broadcast received:", payload);
               const { sessionId: typingSessionId, displayName, isTyping } = payload.payload || {};
+              
+              // Validate payload
+              if (!typingSessionId || !displayName) {
+                console.warn("Invalid typing payload:", payload);
+                return;
+              }
+              
               // Don't show typing indicator for yourself
-              if (typingSessionId === sessionId) return;
+              if (typingSessionId === sessionId) {
+                console.log("Ignoring own typing indicator");
+                return;
+              }
+
+              console.log(`Typing update: ${displayName} is ${isTyping ? "typing" : "not typing"}`);
 
               setTypingUsers((prev) => {
                 const next = new Map(prev);
@@ -169,6 +182,7 @@ export function RoomClient({ roomId }: RoomClientProps) {
                 } else {
                   next.delete(typingSessionId);
                 }
+                console.log("Typing users updated:", Array.from(next.entries()));
                 return next;
               });
             }
@@ -193,6 +207,7 @@ export function RoomClient({ roomId }: RoomClientProps) {
           .subscribe((status, err) => {
             console.log("Realtime subscription status:", status, err);
             if (status === "SUBSCRIBED") {
+              console.log("✅ Realtime channel subscribed - broadcasts will work");
               setConnected(true);
             } else if (status === "CLOSED" || status === "CHANNEL_ERROR") {
               setConnected(false);
@@ -259,7 +274,7 @@ export function RoomClient({ roomId }: RoomClientProps) {
       if (!text || !sessionId) return;
 
       // Stop typing indicator when sending
-      if (channelRef.current) {
+      if (channelRef.current && sessionId && currentUserDisplayName && connected) {
         try {
           await channelRef.current.send({
             type: "broadcast",
@@ -270,6 +285,7 @@ export function RoomClient({ roomId }: RoomClientProps) {
               isTyping: false,
             },
           });
+          console.log("Typing stop sent on message send");
         } catch (err) {
           console.warn("Failed to send typing stop:", err);
         }
@@ -278,6 +294,18 @@ export function RoomClient({ roomId }: RoomClientProps) {
         clearTimeout(typingTimeoutRef.current);
         typingTimeoutRef.current = null;
       }
+
+      // Optimistically add message immediately (better UX)
+      const tempMessageId = `temp-${Date.now()}`;
+      const optimisticMessage: Message = {
+        id: tempMessageId,
+        sender_id: sessionId,
+        sender_name: currentUserDisplayName,
+        content: text,
+        sent_at: new Date().toISOString(),
+      };
+      setMessages((prev) => [...prev, optimisticMessage]);
+      setInput("");
 
       try {
         const res = await fetch(`/api/rooms/${roomId}/messages`, {
@@ -289,11 +317,14 @@ export function RoomClient({ roomId }: RoomClientProps) {
         if (!res.ok) {
           const data = await res.json();
           setJoinError(data.error || "Failed to send message");
+          // Remove optimistic message on error
+          setMessages((prev) => prev.filter((m) => m.id !== tempMessageId));
+          setInput(text); // Restore input
           return;
         }
 
-        // After sending, reload messages to ensure sync (in case postgres_changes fails)
-        // This ensures messages appear even if Realtime has issues
+        // Reload messages to get the real message from DB (replaces optimistic one)
+        // This ensures we have the correct ID and timestamp
         const { data: updatedMessages } = await supabase
           .from("messages")
           .select("*")
@@ -302,11 +333,12 @@ export function RoomClient({ roomId }: RoomClientProps) {
         if (updatedMessages) {
           setMessages(updatedMessages);
         }
-
-        setInput("");
       } catch (error) {
         console.error("Error sending message:", error);
         setJoinError("Failed to send message");
+        // Remove optimistic message on error
+        setMessages((prev) => prev.filter((m) => m.id !== tempMessageId));
+        setInput(text); // Restore input
       }
     },
     [input, sessionId, roomId, currentUserDisplayName]
@@ -532,10 +564,16 @@ export function RoomClient({ roomId }: RoomClientProps) {
                 value={input}
                 onChange={(e) => {
                   setInput(e.target.value);
+                  
+                  // Only send typing if we have all required data and channel is connected
+                  if (!sessionId || !currentUserDisplayName || !channelRef.current || !connected) {
+                    return;
+                  }
+
                   // Broadcast typing indicator
                   const now = Date.now();
                   // Throttle typing broadcasts (max once per 1 second)
-                  if (now - lastTypingBroadcastRef.current > 1000 && channelRef.current) {
+                  if (now - lastTypingBroadcastRef.current > 1000) {
                     lastTypingBroadcastRef.current = now;
                     channelRef.current
                       .send({
@@ -547,7 +585,12 @@ export function RoomClient({ roomId }: RoomClientProps) {
                           isTyping: true,
                         },
                       })
-                      .catch((err) => console.warn("Failed to send typing:", err));
+                      .then(() => {
+                        console.log("Typing indicator sent:", currentUserDisplayName);
+                      })
+                      .catch((err) => {
+                        console.warn("Failed to send typing:", err);
+                      });
                   }
 
                   // Clear existing timeout
@@ -557,7 +600,7 @@ export function RoomClient({ roomId }: RoomClientProps) {
 
                   // Set timeout to stop typing indicator after 3 seconds of inactivity
                   typingTimeoutRef.current = setTimeout(() => {
-                    if (channelRef.current) {
+                    if (channelRef.current && sessionId && currentUserDisplayName) {
                       channelRef.current
                         .send({
                           type: "broadcast",
@@ -568,7 +611,12 @@ export function RoomClient({ roomId }: RoomClientProps) {
                             isTyping: false,
                           },
                         })
-                        .catch((err) => console.warn("Failed to send typing stop:", err));
+                        .then(() => {
+                          console.log("Typing stop sent:", currentUserDisplayName);
+                        })
+                        .catch((err) => {
+                          console.warn("Failed to send typing stop:", err);
+                        });
                     }
                     typingTimeoutRef.current = null;
                   }, 3000);
