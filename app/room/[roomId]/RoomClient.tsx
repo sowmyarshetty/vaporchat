@@ -14,6 +14,7 @@ import { supabase } from "@/lib/supabase/client";
 
 type Message = {
   id: string;
+  room_id: string;
   sender_id: string;
   sender_name: string;
   content: string;
@@ -123,23 +124,26 @@ export function RoomClient({ roomId }: RoomClientProps) {
           });
 
         // Try postgres_changes for INSERT (optional - broadcasts will handle it if this fails)
+        // Note: Filter removed to avoid binding mismatch errors - we filter in callback instead
         channel.on<Message>(
           "postgres_changes",
           {
             event: "INSERT",
             schema: "public",
             table: "messages",
-            filter: `room_id=eq.${roomId}`,
           },
           (payload) => {
             console.log("New message received via postgres_changes:", payload);
             const newMessage = payload.new as Message;
-            setMessages((prev) => {
-              if (prev.some((m) => m.id === newMessage.id)) {
-                return prev;
-              }
-              return [...prev, newMessage];
-            });
+            // Filter by room_id in callback to avoid binding mismatch
+            if (newMessage.room_id === roomId) {
+              setMessages((prev) => {
+                if (prev.some((m) => m.id === newMessage.id)) {
+                  return prev;
+                }
+                return [...prev, newMessage];
+              });
+            }
           }
         );
 
