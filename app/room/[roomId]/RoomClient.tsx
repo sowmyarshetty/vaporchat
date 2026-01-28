@@ -304,6 +304,7 @@ export function RoomClient({ roomId }: RoomClientProps) {
       const tempMessageId = `temp-${Date.now()}`;
       const optimisticMessage: Message = {
         id: tempMessageId,
+        room_id: roomId,
         sender_id: sessionId,
         sender_name: currentUserDisplayName,
         content: text,
