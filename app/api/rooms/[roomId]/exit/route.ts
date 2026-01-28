@@ -35,16 +35,9 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     // Delete session (participant)
     await supabaseAdmin.from("sessions").delete().eq("id", sessionId);
 
-    // Check if room is empty, delete if so
-    const { data: remainingSessions } = await supabaseAdmin
-      .from("sessions")
-      .select("id")
-      .eq("room_id", roomId)
-      .limit(1);
-
-    if (!remainingSessions || remainingSessions.length === 0) {
-      await supabaseAdmin.from("rooms").delete().eq("id", roomId);
-    }
+    // Delete the room when user exits (vapor chat - ephemeral by design)
+    // This ensures the room is completely removed when anyone leaves
+    await supabaseAdmin.from("rooms").delete().eq("id", roomId);
 
     return NextResponse.json({ success: true });
   } catch (error) {

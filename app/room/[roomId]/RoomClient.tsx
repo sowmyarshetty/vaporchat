@@ -194,7 +194,8 @@ export function RoomClient({ roomId }: RoomClientProps) {
               // Primary mechanism: broadcast for new messages (more reliable)
               console.log("New message via broadcast:", payload);
               const newMessage = payload.payload as Message;
-              if (newMessage && newMessage.room_id === roomId) {
+              // No need to check room_id - we're already on a room-specific channel
+              if (newMessage && newMessage.id) {
                 setMessages((prev) => {
                   if (prev.some((m) => m.id === newMessage.id)) {
                     return prev;
