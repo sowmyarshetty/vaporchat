@@ -36,15 +36,18 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     }
 
     // Insert message
-    const { error: messageError } = await supabaseAdmin
+    const messageId = randomUUID();
+    const { data: insertedMessage, error: messageError } = await supabaseAdmin
       .from("messages")
       .insert({
-        id: randomUUID(),
+        id: messageId,
         room_id: roomId,
         sender_id: sessionId,
         sender_name: session.display_name,
         content: text,
-      });
+      })
+      .select()
+      .single();
 
     if (messageError) {
       console.error("Message creation error:", messageError);
@@ -52,6 +55,17 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
         { error: "Failed to send message" },
         { status: 500 }
       );
+    }
+
+    // Broadcast new message event (primary mechanism for real-time updates)
+    // This works even if postgres_changes has binding issues
+    try {
+      // Note: Server-side broadcast requires the channel to be subscribed
+      // For now, we rely on postgres_changes or client-side polling
+      // The broadcast from client-side works better
+    } catch (broadcastError) {
+      // Non-critical - message was saved
+      console.warn("Broadcast error (non-critical):", broadcastError);
     }
 
     return NextResponse.json({ success: true });

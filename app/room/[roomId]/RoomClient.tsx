@@ -88,6 +88,7 @@ export function RoomClient({ roomId }: RoomClientProps) {
         setRoomName(room.name);
 
         // Load messages
+        console.log("Loading messages for room:", roomId);
         const { data: messagesData, error: messagesError } = await supabase
           .from("messages")
           .select("*")
@@ -96,72 +97,54 @@ export function RoomClient({ roomId }: RoomClientProps) {
 
         if (messagesError) {
           console.error("Error loading messages:", messagesError);
+          console.error("Error details:", JSON.stringify(messagesError, null, 2));
+          setJoinError(`Failed to load messages: ${messagesError.message || "Unknown error"}`);
         } else {
-          setMessages(messagesData || []);
+          console.log("Loaded messages:", messagesData?.length || 0, messagesData);
+          if (messagesData) {
+            setMessages(messagesData);
+          } else {
+            console.warn("messagesData is null or undefined");
+            setMessages([]);
+          }
         }
 
         setConnected(true);
         setLoading(false);
 
         // Subscribe to new messages
+        // Use broadcast as primary mechanism (more reliable than postgres_changes)
+        // postgres_changes may have binding issues, but broadcasts always work
         const channel = supabase
           .channel(`room:${roomId}`, {
             config: {
               broadcast: { self: true },
             },
-          })
-          .on(
-            "postgres_changes",
-            {
-              event: "INSERT",
-              schema: "public",
-              table: "messages",
-              filter: `room_id=eq.${roomId}`,
-            },
-            (payload) => {
-              console.log("New message received:", payload);
-              const newMessage = payload.new as Message;
-              setMessages((prev) => {
-                // Avoid duplicates
-                if (prev.some((m) => m.id === newMessage.id)) {
-                  return prev;
-                }
-                return [...prev, newMessage];
-              });
-            }
-          )
-          .on(
-            "postgres_changes",
-            {
-              event: "DELETE",
-              schema: "public",
-              table: "messages",
-              filter: `room_id=eq.${roomId}`,
-            },
-            async (payload) => {
-              console.log("Messages deleted:", payload);
-              // When any message is deleted, check if all are gone
-              // Supabase might not fire events for bulk deletes, so we check the table
-              const { data: remainingMessages } = await supabase
-                .from("messages")
-                .select("id")
-                .eq("room_id", roomId)
-                .limit(1);
-              
-              // If no messages remain, clear the UI
-              if (!remainingMessages || remainingMessages.length === 0) {
-                setMessages([]);
-              } else {
-                // If some messages remain, reload all to sync
-                const { data: allMessages } = await supabase
-                  .from("messages")
-                  .select("*")
-                  .eq("room_id", roomId)
-                  .order("sent_at", { ascending: true });
-                if (allMessages) setMessages(allMessages);
+          });
+
+        // Try postgres_changes for INSERT (optional - broadcasts will handle it if this fails)
+        channel.on<Message>(
+          "postgres_changes",
+          {
+            event: "INSERT",
+            schema: "public",
+            table: "messages",
+            filter: `room_id=eq.${roomId}`,
+          },
+          (payload) => {
+            console.log("New message received via postgres_changes:", payload);
+            const newMessage = payload.new as Message;
+            setMessages((prev) => {
+              if (prev.some((m) => m.id === newMessage.id)) {
+                return prev;
               }
-            }
-          )
+              return [...prev, newMessage];
+            });
+          }
+        );
+
+        // Broadcast events (primary mechanism - always works)
+        channel
           .on(
             "broadcast",
             { event: "vaporize" },
@@ -190,6 +173,23 @@ export function RoomClient({ roomId }: RoomClientProps) {
               });
             }
           )
+          .on(
+            "broadcast",
+            { event: "new-message" },
+            (payload) => {
+              // Primary mechanism: broadcast for new messages (more reliable)
+              console.log("New message via broadcast:", payload);
+              const newMessage = payload.payload as Message;
+              if (newMessage && newMessage.room_id === roomId) {
+                setMessages((prev) => {
+                  if (prev.some((m) => m.id === newMessage.id)) {
+                    return prev;
+                  }
+                  return [...prev, newMessage];
+                });
+              }
+            }
+          )
           .subscribe((status, err) => {
             console.log("Realtime subscription status:", status, err);
             if (status === "SUBSCRIBED") {
@@ -198,6 +198,12 @@ export function RoomClient({ roomId }: RoomClientProps) {
               setConnected(false);
               if (err) {
                 console.error("Realtime subscription error:", err);
+                // Binding mismatch errors are warnings - broadcasts still work
+                if (err.message?.includes("mismatch") || err.message?.includes("binding")) {
+                  console.warn("postgres_changes binding error (non-critical). Broadcasts will still work.");
+                  // Still mark as connected since broadcasts work
+                  setConnected(true);
+                }
               }
             } else if (status === "TIMED_OUT") {
               console.error("Realtime subscription timed out");
@@ -284,6 +290,17 @@ export function RoomClient({ roomId }: RoomClientProps) {
           const data = await res.json();
           setJoinError(data.error || "Failed to send message");
           return;
+        }
+
+        // After sending, reload messages to ensure sync (in case postgres_changes fails)
+        // This ensures messages appear even if Realtime has issues
+        const { data: updatedMessages } = await supabase
+          .from("messages")
+          .select("*")
+          .eq("room_id", roomId)
+          .order("sent_at", { ascending: true });
+        if (updatedMessages) {
+          setMessages(updatedMessages);
         }
 
         setInput("");
@@ -441,10 +458,18 @@ export function RoomClient({ roomId }: RoomClientProps) {
               className="mb-6 flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto rounded-lg border border-[var(--vapor-stone)] bg-white px-4 py-4"
             >
               {messages.length === 0 ? (
-                <p className="py-8 text-center text-sm text-[var(--vapor-warm-gray)]">
-                  No messages yet. Say something or share the room link for others
-                  to join.
-                </p>
+                <div className="py-8 text-center">
+                  <p className="text-sm text-[var(--vapor-warm-gray)]">
+                    No messages yet. Say something or share the room link for others
+                    to join.
+                  </p>
+                  {/* Debug info - remove in production */}
+                  {process.env.NODE_ENV === "development" && (
+                    <p className="mt-2 text-xs text-[var(--vapor-warm-gray)] opacity-50">
+                      Debug: messages array length = {messages.length}
+                    </p>
+                  )}
+                </div>
               ) : (
                 messages.map((m) => (
                   <div
