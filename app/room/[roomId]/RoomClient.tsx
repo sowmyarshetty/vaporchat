@@ -35,8 +35,12 @@ export function RoomClient({ roomId }: RoomClientProps) {
   const [connected, setConnected] = useState(false);
   const [joinError, setJoinError] = useState("");
   const [loading, setLoading] = useState(true);
+  const [typingUsers, setTypingUsers] = useState<Map<string, string>>(new Map()); // sessionId -> displayName
+  const [currentUserDisplayName, setCurrentUserDisplayName] = useState("");
   const listRef = useRef<HTMLDivElement>(null);
   const channelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
+  const typingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const lastTypingBroadcastRef = useRef<number>(0);
 
   // Load initial room data and messages
   useEffect(() => {
@@ -64,6 +68,9 @@ export function RoomClient({ roomId }: RoomClientProps) {
           setLoading(false);
           return;
         }
+
+        // Store current user's display name for typing indicators
+        setCurrentUserDisplayName(session.display_name);
 
         // Load room name
         const { data: room, error: roomError } = await supabase
@@ -164,6 +171,25 @@ export function RoomClient({ roomId }: RoomClientProps) {
               setMessages([]);
             }
           )
+          .on(
+            "broadcast",
+            { event: "typing" },
+            (payload) => {
+              const { sessionId: typingSessionId, displayName, isTyping } = payload.payload || {};
+              // Don't show typing indicator for yourself
+              if (typingSessionId === sessionId) return;
+
+              setTypingUsers((prev) => {
+                const next = new Map(prev);
+                if (isTyping) {
+                  next.set(typingSessionId, displayName);
+                } else {
+                  next.delete(typingSessionId);
+                }
+                return next;
+              });
+            }
+          )
           .subscribe((status, err) => {
             console.log("Realtime subscription status:", status, err);
             if (status === "SUBSCRIBED") {
@@ -190,22 +216,62 @@ export function RoomClient({ roomId }: RoomClientProps) {
     loadRoom();
 
     return () => {
+      if (typingTimeoutRef.current) {
+        clearTimeout(typingTimeoutRef.current);
+        typingTimeoutRef.current = null;
+      }
       if (channelRef.current) {
+        // Send typing stop before leaving
+        if (sessionId && currentUserDisplayName) {
+          channelRef.current
+            .send({
+              type: "broadcast",
+              event: "typing",
+              payload: {
+                sessionId,
+                displayName: currentUserDisplayName,
+                isTyping: false,
+              },
+            })
+            .catch(() => {});
+        }
         supabase.removeChannel(channelRef.current);
         channelRef.current = null;
       }
     };
-  }, [roomId, sessionId, router]);
+  }, [roomId, sessionId, router, currentUserDisplayName]);
 
   useEffect(() => {
     listRef.current?.scrollTo(0, listRef.current.scrollHeight);
   }, [messages]);
+
 
   const handleSend = useCallback(
     async (e: FormEvent) => {
       e.preventDefault();
       const text = input.trim();
       if (!text || !sessionId) return;
+
+      // Stop typing indicator when sending
+      if (channelRef.current) {
+        try {
+          await channelRef.current.send({
+            type: "broadcast",
+            event: "typing",
+            payload: {
+              sessionId,
+              displayName: currentUserDisplayName,
+              isTyping: false,
+            },
+          });
+        } catch (err) {
+          console.warn("Failed to send typing stop:", err);
+        }
+      }
+      if (typingTimeoutRef.current) {
+        clearTimeout(typingTimeoutRef.current);
+        typingTimeoutRef.current = null;
+      }
 
       try {
         const res = await fetch(`/api/rooms/${roomId}/messages`, {
@@ -226,7 +292,7 @@ export function RoomClient({ roomId }: RoomClientProps) {
         setJoinError("Failed to send message");
       }
     },
-    [input, sessionId, roomId]
+    [input, sessionId, roomId, currentUserDisplayName]
   );
 
   const handleVaporize = useCallback(async () => {
@@ -411,6 +477,24 @@ export function RoomClient({ roomId }: RoomClientProps) {
             </div>
           )}
 
+          {/* Typing indicators */}
+          {typingUsers.size > 0 && (
+            <div className="mb-2 flex items-center gap-2 px-2">
+              <div className="flex gap-1">
+                <span className="h-1 w-1 animate-pulse rounded-full bg-[var(--vapor-amber)]" />
+                <span className="h-1 w-1 animate-pulse rounded-full bg-[var(--vapor-amber)] delay-75" />
+                <span className="h-1 w-1 animate-pulse rounded-full bg-[var(--vapor-amber)] delay-150" />
+              </div>
+              <p className="text-xs text-[var(--vapor-warm-gray)] italic">
+                {typingUsers.size === 1
+                  ? `${Array.from(typingUsers.values())[0]} is typing...`
+                  : typingUsers.size === 2
+                    ? `${Array.from(typingUsers.values()).join(" and ")} are typing...`
+                    : `${Array.from(typingUsers.values())[0]} and ${typingUsers.size - 1} others are typing...`}
+              </p>
+            </div>
+          )}
+
           <form onSubmit={handleSend} className="space-y-4">
             <div>
               <label htmlFor="room-message" className="sr-only">
@@ -421,7 +505,49 @@ export function RoomClient({ roomId }: RoomClientProps) {
                 type="text"
                 placeholder="Type your message…"
                 value={input}
-                onChange={(e) => setInput(e.target.value)}
+                onChange={(e) => {
+                  setInput(e.target.value);
+                  // Broadcast typing indicator
+                  const now = Date.now();
+                  // Throttle typing broadcasts (max once per 1 second)
+                  if (now - lastTypingBroadcastRef.current > 1000 && channelRef.current) {
+                    lastTypingBroadcastRef.current = now;
+                    channelRef.current
+                      .send({
+                        type: "broadcast",
+                        event: "typing",
+                        payload: {
+                          sessionId,
+                          displayName: currentUserDisplayName,
+                          isTyping: true,
+                        },
+                      })
+                      .catch((err) => console.warn("Failed to send typing:", err));
+                  }
+
+                  // Clear existing timeout
+                  if (typingTimeoutRef.current) {
+                    clearTimeout(typingTimeoutRef.current);
+                  }
+
+                  // Set timeout to stop typing indicator after 3 seconds of inactivity
+                  typingTimeoutRef.current = setTimeout(() => {
+                    if (channelRef.current) {
+                      channelRef.current
+                        .send({
+                          type: "broadcast",
+                          event: "typing",
+                          payload: {
+                            sessionId,
+                            displayName: currentUserDisplayName,
+                            isTyping: false,
+                          },
+                        })
+                        .catch((err) => console.warn("Failed to send typing stop:", err));
+                    }
+                    typingTimeoutRef.current = null;
+                  }, 3000);
+                }}
                 className="w-full rounded-lg border border-[var(--vapor-stone)] bg-white px-4 py-3 text-[var(--vapor-charcoal)] placeholder:text-[var(--vapor-warm-gray)] focus:border-[var(--vapor-amber)] focus:outline-none focus:ring-1 focus:ring-[var(--vapor-amber)]"
                 autoComplete="off"
                 disabled={!!joinError || loading}
