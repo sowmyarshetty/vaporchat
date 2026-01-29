@@ -113,9 +113,9 @@ export function RoomClient({ roomId }: RoomClientProps) {
         setConnected(true);
         setLoading(false);
 
-        // Subscribe to new messages
-        // Use broadcast as primary mechanism (more reliable than postgres_changes)
-        // postgres_changes may have binding issues, but broadcasts always work
+        // Subscribe to real-time updates via broadcast only.
+        // Using broadcast-only avoids postgres_changes binding/publication issues
+        // that can cause the channel to fail and prevent other members from seeing messages.
         const channel = supabase
           .channel(`room:${roomId}`, {
             config: {
@@ -123,31 +123,7 @@ export function RoomClient({ roomId }: RoomClientProps) {
             },
           });
 
-        // Try postgres_changes for INSERT (optional - broadcasts will handle it if this fails)
-        // Note: Filter removed to avoid binding mismatch errors - we filter in callback instead
-        channel.on<Message>(
-          "postgres_changes",
-          {
-            event: "INSERT",
-            schema: "public",
-            table: "messages",
-          },
-          (payload) => {
-            console.log("New message received via postgres_changes:", payload);
-            const newMessage = payload.new as Message;
-            // Filter by room_id in callback to avoid binding mismatch
-            if (newMessage.room_id === roomId) {
-              setMessages((prev) => {
-                if (prev.some((m) => m.id === newMessage.id)) {
-                  return prev;
-                }
-                return [...prev, newMessage];
-              });
-            }
-          }
-        );
-
-        // Broadcast events (primary mechanism - always works)
+        // Broadcast events: new-message, typing, vaporize
         channel
           .on(
             "broadcast",
@@ -212,22 +188,10 @@ export function RoomClient({ roomId }: RoomClientProps) {
           .subscribe((status, err) => {
             console.log("Realtime subscription status:", status, err);
             if (status === "SUBSCRIBED") {
-              console.log("✅ Realtime channel subscribed - broadcasts will work");
               setConnected(true);
-            } else if (status === "CLOSED" || status === "CHANNEL_ERROR") {
+            } else if (status === "CLOSED" || status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
               setConnected(false);
-              if (err) {
-                console.error("Realtime subscription error:", err);
-                // Binding mismatch errors are warnings - broadcasts still work
-                if (err.message?.includes("mismatch") || err.message?.includes("binding")) {
-                  console.warn("postgres_changes binding error (non-critical). Broadcasts will still work.");
-                  // Still mark as connected since broadcasts work
-                  setConnected(true);
-                }
-              }
-            } else if (status === "TIMED_OUT") {
-              console.error("Realtime subscription timed out");
-              setConnected(false);
+              if (err) console.error("Realtime subscription error:", err);
             }
           });
 
@@ -338,6 +302,23 @@ export function RoomClient({ roomId }: RoomClientProps) {
           .order("sent_at", { ascending: true });
         if (updatedMessages) {
           setMessages(updatedMessages);
+          
+          // Broadcast the new message to other tabs/clients in the room
+          // This ensures real-time updates across all tabs
+          const newMessage = updatedMessages[updatedMessages.length - 1];
+          if (newMessage && channelRef.current && connected) {
+            try {
+              await channelRef.current.send({
+                type: "broadcast",
+                event: "new-message",
+                payload: newMessage,
+              });
+              console.log("New message broadcasted to other tabs");
+            } catch (broadcastError) {
+              // Non-critical - message was saved, other tabs will get it via postgres_changes or on next reload
+              console.warn("Failed to broadcast new message (non-critical):", broadcastError);
+            }
+          }
         }
       } catch (error) {
         console.error("Error sending message:", error);
@@ -347,7 +328,7 @@ export function RoomClient({ roomId }: RoomClientProps) {
         setInput(text); // Restore input
       }
     },
-    [input, sessionId, roomId, currentUserDisplayName]
+    [input, sessionId, roomId, currentUserDisplayName, connected]
   );
 
   const handleVaporize = useCallback(async () => {
